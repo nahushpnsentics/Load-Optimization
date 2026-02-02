@@ -101,7 +101,7 @@ def pack_once(container_type, items, chart):
     for _, b in items:
         if b["length"] >= avg_length:
             count += 1
-    if count < 4:
+    if count < 5:
         items = sorted(items, key=lambda x: (-x[1]["length"]*x[1]["width"]*x[1]["height"],-x[1]["length"]))
 
     for name, box in items:
@@ -142,10 +142,7 @@ def pack_once(container_type, items, chart):
                     continue
 
 
-                left_heights = [
-                    h for x, h in col_height.items()
-                    if x < col_x
-                ]
+                left_heights = [h for x, h in col_height.items() if x < col_x]
 
                 if left_heights:
                     max_left_height = max(left_heights)
@@ -449,9 +446,10 @@ elif st.session_state.page == "result":
             allowed.append(allowed_weight_at_x(x + 500, chart))
         ax.plot(xs, allowed, label="Allowed Weight", color="red", linestyle="--")
         ax.plot(xs, loads, label="Occupied Weight", color="green",linestyle="--")
-        for num,( x, y) in enumerate(zip(xs, loads)):
-            if num%2==0:
-                ax.text(x+200, y+500 , f"{y:.2f}", ha="center", fontsize=9, weight="bold")
+        ax.set_xticks(range(0, x_max + 1, 1000))
+        # for num,( x, y) in enumerate(zip(xs, loads)):
+        #     if num%2==0:
+        #         ax.text(x+200, y+500 , f"{y:.2f}", ha="center", fontsize=9, weight="bold")
         ax.set_xlabel("Length (mm)")
         ax.set_ylabel("Weight (Kg)")
         ax.set_title("Distribution Curve")
