@@ -450,15 +450,17 @@ elif st.session_state.page == "result":
 
         for band, items in bands.items():
             if not items:
-                band_metrics[band] = (0, 0)
+                band_metrics[band] = (0, 0, 0)
             else:
+                total_weight = sum(p["weight"] for p in items)
                 max_x = max(p["x_e"] for p in items)
                 total_height = sum(p["h"] for p in items)
-                band_metrics[band] = (max_x, total_height)
 
+                band_metrics[band] = (total_weight, max_x, total_height)
+                
         sorted_bands = sorted(
             band_metrics.items(),
-            key=lambda x: (-x[1][0], -x[1][1])
+            key=lambda x: (-x[1][0], -x[1][1], -x[1][2])
         )
 
         band_remap = {}
@@ -612,5 +614,3 @@ elif st.session_state.page == "result":
         st.pyplot(fig)
         plt.close(fig)
 
-
-    
