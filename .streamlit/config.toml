@@ -1,0 +1,12 @@
+# Listen on all interfaces (same as `streamlit run --server.address 0.0.0.0`).
+# Safe on a trusted LAN or Tailscale tail; do not expose 8501 directly to the public internet.
+[server]
+address = "0.0.0.0"
+port = 8501
+headless = true
+enableCORS = true
+# Allow opening the app via Tailscale MagicDNS / hostname without XSRF session errors.
+enableXsrfProtection = false
+
+[browser]
+gatherUsageStats = false

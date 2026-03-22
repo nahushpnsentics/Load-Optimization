@@ -97,6 +97,10 @@ python init_minio.py
 
 echo.
 echo Starting Streamlit on 0.0.0.0:8501
+where tailscale >nul 2>&1
+if not errorlevel 1 (
+  for /f "usebackq delims=" %%i in (`tailscale ip -4 2^>nul`) do echo Tailscale — try from another device: http://%%i:8501
+)
 echo ==========================================
 streamlit run app.py --server.address 0.0.0.0
 

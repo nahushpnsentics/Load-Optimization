@@ -18,7 +18,18 @@
 
    On Windows: `run.bat`
 
-   Streamlit listens on **0.0.0.0** so other machines (e.g. Tailscale peers) can open `http://<host>:8501`.
+   Streamlit listens on **0.0.0.0** (see `.streamlit/config.toml`). Other machines on your **Tailscale** tail can use:
+
+   - **`http://<Tailscale-IP>:8501`** — e.g. `100.x.y.z` (`tailscale ip -4` on the host)
+   - **`http://<magicdns-name>:8501`** — if MagicDNS is enabled (e.g. `my-pc.tailnet-name.ts.net`)
+
+   `run.sh` / `run.bat` print a suggested URL when the `tailscale` CLI is installed.
+
+   **Notes**
+
+   - MinIO stays on **localhost** on the host; only Streamlit must be reachable over Tailscale. The browser talks to Streamlit; the app talks to MinIO locally.
+   - `.streamlit/config.toml` sets **`enableXsrfProtection = false`** so the UI works when you open it by hostname/IP (common Tailscale case). Use only on a trusted tail, not on a public internet bind.
+   - Allow **port 8501** in the host firewall for Tailscale (or “Tailscale” interface only) if connections fail.
 
 3. **Environment**
 

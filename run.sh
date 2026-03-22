@@ -116,5 +116,13 @@ python init_minio.py || true
 
 echo ""
 echo "Starting Streamlit on 0.0.0.0:8501"
+if command -v tailscale &>/dev/null; then
+  _ts_ip="$(tailscale ip -4 2>/dev/null || true)"
+  _ts_dns="$(tailscale status --json 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('Self',{}).get('DNSName','').rstrip('.'))" 2>/dev/null || true)"
+  if [ -n "$_ts_ip" ]; then
+    echo "Tailscale — open from another device: http://${_ts_ip}:8501"
+    [ -n "$_ts_dns" ] && echo "           or: http://${_ts_dns}:8501"
+  fi
+fi
 echo "=========================================="
 exec streamlit run app.py --server.address 0.0.0.0
