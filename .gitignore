@@ -1,2 +1,4 @@
 .venv/
 venv/
+# Local MinIO Docker volume (run.sh / run.bat)
+minio-data/
