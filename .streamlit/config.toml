@@ -7,6 +7,10 @@ headless = true
 enableCORS = true
 # Allow opening the app via Tailscale MagicDNS / hostname without XSRF session errors.
 enableXsrfProtection = false
+# Use polling instead of inotify to avoid "OSError: [Errno 28] inotify watch limit reached"
+# when venv/ and minio-data/ contain many files. Slightly higher CPU, no kernel-side watches.
+fileWatcherType = "poll"
+folderWatchBlacklist = ["venv", ".venv", "minio-data", "__pycache__", ".git"]
 
 [browser]
 gatherUsageStats = false

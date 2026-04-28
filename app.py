@@ -3,7 +3,7 @@ from __future__ import annotations
 import streamlit as st
 from collections import Counter, defaultdict
 from copy import deepcopy
-from datetime import datetime
+from datetime import datetime, date, timedelta
 import hashlib
 import json
 import random
@@ -133,7 +133,7 @@ if _schn_path.is_file():
     _schn_b64 = base64.b64encode(_schn_path.read_bytes()).decode()
     # Native asset is 464×109; flex centers on full page (columns alone left-align the image in the cell).
     st.markdown(
-        f'<div style="display:flex;justify-content:center;width:100%;margin:0.25rem 0 0.75rem 0;">'
+        f'<div id="schnellecke-header" style="display:flex;justify-content:center;width:100%;margin:0.25rem 0 0.75rem 0;">'
         f'<img src="data:image/png;base64,{_schn_b64}" alt="Schnellecke" '
         f'style="width:464px;max-width:min(92vw,464px);height:auto;display:block;" />'
         f"</div>",
@@ -604,6 +604,78 @@ def parse_order_excel_quantities(buf, mode: str = "rows") -> dict[str, int]:
     return dict(sums)
 
 
+def parse_catalog_excel(buf) -> tuple[list[tuple[str, date]], list[str]]:
+    """
+    Parse a "full catalog" file (e.g. time.XLSX) into one entry per row:
+    `(material_key, Abholtermin date)`. Returns the entries plus a list of
+    skipped material numbers (date or material missing).
+    """
+    _require_openpyxl()
+    df = pd.read_excel(buf, header=0, engine="openpyxl")
+    df.columns = [str(c).strip() for c in df.columns]
+    c_mat = _match_column_by_patterns(
+        df,
+        [
+            "materialnummer",
+            "materialnumber",
+            "materialno",
+            "matnr",
+            "material",
+            "articlenumber",
+            "article number",
+            "partnumber",
+            "sku",
+        ],
+    )
+    c_date = _match_column_by_patterns(
+        df,
+        [
+            "abholtermin",
+            "abholdatum",
+            "pickupdate",
+            "pickup date",
+            "collectiondate",
+            "collection date",
+            "liefertermin",
+            "lieferdatum",
+            "deliverydate",
+            "delivery date",
+            "duedate",
+            "due date",
+        ],
+    )
+    if not c_mat:
+        raise ValueError(
+            "Catalog file needs a Material column (Material / Materialnummer). "
+            f"Found: {', '.join(map(str, df.columns))}"
+        )
+    if not c_date:
+        raise ValueError(
+            "Catalog file needs an **Abholtermin** (or pickup/delivery date) column. "
+            f"Found: {', '.join(map(str, df.columns))}"
+        )
+
+    out: list[tuple[str, date]] = []
+    skipped: list[str] = []
+    for _, r in df.iterrows():
+        m = normalize_materialnummer(r.get(c_mat))
+        raw_d = r.get(c_date)
+        if m is None:
+            continue
+        if raw_d is None or (isinstance(raw_d, float) and np.isnan(raw_d)):
+            skipped.append(m)
+            continue
+        try:
+            ts = pd.to_datetime(raw_d, errors="coerce")
+        except (TypeError, ValueError):
+            ts = pd.NaT
+        if pd.isna(ts):
+            skipped.append(m)
+            continue
+        out.append((m, ts.date()))
+    return out, skipped
+
+
 def build_load_and_preview(df: pd.DataFrame):
     # German + English header synonyms (flat matching)
     c_mat = _match_column_by_patterns(
@@ -946,7 +1018,7 @@ def sort_rows_by_height(placements, container_type):
 
     return result
 
-def pack_once(container_type, items, chart, forbidden_on):
+def pack_once(container_type, items, chart, forbidden_on, resort=True):
     c = container[container_type]
 
     free_spaces = [{
@@ -963,7 +1035,10 @@ def pack_once(container_type, items, chart, forbidden_on):
     row_height = {}
     row_cap = {0: c["height"]}
 
-    items = sorted(items, key=lambda x: x[1]["length"])
+    # Only re-sort when the caller hasn't already chosen an ordering (e.g.
+    # pack_3d supplies randomised / volume-sorted seeds that must be preserved).
+    if resort:
+        items = sorted(items, key=lambda x: x[1]["length"])
 
     for name, box in items:
         
@@ -1084,19 +1159,38 @@ def pack_once(container_type, items, chart, forbidden_on):
 
 def pack_3d(container_type, items, chart, forbidden_on, runs=50):
     best = []
-    best_score = (-1, -1)
+    best_score = (-1, -1, -1.0)
     best_raw = []
 
     load_ref = {}
     for n, b in items:
         load_ref[n] = b
 
-    for _ in range(runs):
-        shuffled = items[:]
-        random.shuffle(shuffled)
+    # Seed orderings: the first is the legacy length-ascending sort (so single-
+    # truck results never regress), followed by a handful of heuristic sorts
+    # that are strong for bin packing (largest-volume first, longest first,
+    # heaviest first). Any remaining runs are genuine random permutations.
+    seeds: list[list] = [
+        sorted(items, key=lambda x: x[1]["length"]),
+        sorted(items, key=lambda x: -(x[1]["length"] * x[1]["width"] * x[1]["height"])),
+        sorted(items, key=lambda x: -x[1]["length"]),
+        sorted(items, key=lambda x: -x[1]["weight"]),
+        sorted(items, key=lambda x: (-x[1]["height"], -x[1]["length"])),
+    ]
 
-        placements = pack_once(container_type, shuffled, chart, forbidden_on)
-        score = (len(placements), sum(p["weight"] for p in placements))
+    for r in range(max(1, runs)):
+        if r < len(seeds):
+            candidate_items = seeds[r]
+        else:
+            candidate_items = items[:]
+            random.shuffle(candidate_items)
+
+        placements = pack_once(
+            container_type, candidate_items, chart, forbidden_on, resort=False
+        )
+        occ_vol = sum(p["l"] * p["w"] * p["h"] for p in placements)
+        # Prefer more items, then more volume, then more weight.
+        score = (len(placements), occ_vol, sum(p["weight"] for p in placements))
 
         if score > best_score:
             best = placements
@@ -1123,6 +1217,798 @@ def pack_3d(container_type, items, chart, forbidden_on, runs=50):
     else:
         best = best_raw
     return best, unplaced_counts, placed_counts
+
+
+def _detect_natural_rows(placements, container_width):
+    """
+    Decide how many side-by-side rows (1–3) fit the truck for the given item
+    set, using the widest item as the binding budget so the layout is safe even
+    when widths are mixed. Returns the Y-center of each row.
+    """
+    if not placements:
+        return []
+    GAP_Y = 30
+    available = float(container_width)
+    widest = max(float(p["w"]) for p in placements)
+    if widest <= 0:
+        return [available / 2.0]
+
+    n_rows = 1
+    used = widest
+    while n_rows < 3 and used + GAP_Y + widest <= available:
+        used += GAP_Y + widest
+        n_rows += 1
+
+    if n_rows == 1:
+        centers = [available / 2.0]
+    elif n_rows == 2:
+        c1 = widest / 2.0 + GAP_Y
+        c2 = available - widest / 2.0 - GAP_Y
+        centers = [c1, c2]
+    else:
+        step = available / 3.0
+        centers = [step / 2.0, step + step / 2.0, 2 * step + step / 2.0]
+    return centers
+
+
+def systematic_layout(placements, container_type, chart, load_ref, forbidden_on=None):
+    """
+    Reorganize an existing valid packing into a warehouse-style "systematic"
+    layout that's easy for a loader to follow:
+
+      * All items of the same material are grouped into one or more vertical
+        stacks (one column per stack).
+      * Stack height is capped by the material's `stapelfaktor` and the
+        container height — no half-empty stacks just because the packer ran
+        out of space partway through a material.
+      * Each row uses a single orientation (the bottom item's L/W), so items
+        line up cleanly without diagonal gaps.
+      * Stacks are placed row-by-row, longest first, balancing rows by their
+        current X position.
+
+    Falls back to the input `placements` if the systematic layout would
+    overflow the container length, overlap, or violate weight / forbidden_on /
+    stapelfaktor rules.
+    """
+    if not placements:
+        return placements
+
+    c = container[container_type]
+    forbidden_on = forbidden_on or {}
+
+    by_mat: dict[str, list[dict]] = defaultdict(list)
+    for p in placements:
+        by_mat[p["item"]].append(p)
+
+    stacks: list[list[dict]] = []
+    for mat, items in by_mat.items():
+        if not items:
+            continue
+        sf = _stapelfaktor_from_box(load_ref.get(mat, {}))
+        item_h = items[0]["h"]
+        max_by_height = max(1, int(c["height"] // max(1, item_h)))
+        stack_size = max(1, min(int(sf), max_by_height, len(items)))
+        items_sorted = sorted(items, key=lambda p: -p["weight"])
+        for i in range(0, len(items_sorted), stack_size):
+            stacks.append(items_sorted[i:i + stack_size])
+
+    if not stacks:
+        return placements
+
+    widest = max(p["w"] for p in placements)
+    GAP_Y = 30
+    n_rows = max(1, min(3, int((c["width"] + GAP_Y) // (widest + GAP_Y))))
+
+    if n_rows == 1:
+        centers = [c["width"] / 2.0]
+    elif n_rows == 2:
+        centers = [widest / 2.0 + GAP_Y, c["width"] - widest / 2.0 - GAP_Y]
+    else:
+        step = c["width"] / 3.0
+        centers = [step / 2.0, step + step / 2.0, 2 * step + step / 2.0]
+
+    stacks.sort(
+        key=lambda stk: (
+            -stk[0]["l"],
+            -sum(p["weight"] for p in stk),
+            -len(stk),
+        )
+    )
+
+    # No forced spacing — items sit flush against each other, exactly as a
+    # warehouse loader would push them.  Even small gaps add up across many
+    # columns and used to leave whole stacks unplaced (forcing a fallback
+    # to the raw pack_3d output, which is what the user saw as a single
+    # isolated item floating in the middle of a row).
+    GAP_X = 0
+    FRONT_X = 0
+    row_x = [FRONT_X] * n_rows
+    new_placements: list[dict] = []
+
+    for stk in stacks:
+        bot = stk[0]
+        l = float(bot["l"])
+        w = float(bot["w"])
+
+        # Pick the row with the smallest current X cursor; if it cannot
+        # accommodate this stack, try every other row before giving up.
+        row_order = sorted(range(n_rows), key=lambda r: row_x[r])
+        row_idx = None
+        for r in row_order:
+            if row_x[r] + l <= c["length"]:
+                row_idx = r
+                break
+        if row_idx is None:
+            continue
+        x = row_x[row_idx]
+
+        cy = centers[row_idx]
+        y0 = cy - w / 2.0
+        y1 = y0 + w
+        if y0 < 0:
+            y0, y1 = 0.0, w
+        if y1 > c["width"]:
+            y1, y0 = float(c["width"]), float(c["width"]) - w
+
+        z_cursor = 0.0
+        layers_for_stack: list[dict] = []
+        for p in stk:
+            np_ = dict(p)
+            np_["x"] = x
+            np_["x_e"] = x + l
+            np_["y"] = y0
+            np_["y_e"] = y1
+            np_["z"] = z_cursor
+            np_["z_e"] = z_cursor + p["h"]
+            if z_cursor + p["h"] > c["height"]:
+                break
+            if layers_for_stack and violates_forbidden(np_, layers_for_stack, forbidden_on):
+                break
+            layers_for_stack.append(np_)
+            z_cursor += p["h"]
+
+        if not layers_for_stack:
+            continue
+        new_placements.extend(layers_for_stack)
+        row_x[row_idx] += l + GAP_X
+
+    if len(new_placements) < len(placements):
+        return placements
+
+    for i, a in enumerate(new_placements):
+        for b in new_placements[i + 1:]:
+            if overlaps(a, b):
+                return placements
+
+    if not placements_respect_stapelfaktor(new_placements, load_ref):
+        return placements
+
+    bins = compute_x_weight_bins(new_placements, x_max=c["length"])
+    bs = 1000
+    for x_bin, w_in_bin in bins.items():
+        if w_in_bin > allowed_weight_at_x(x_bin + bs / 2, chart):
+            return placements
+
+    return new_placements
+
+
+def smooth_row_heights(placements, container_type, chart, load_ref):
+    """
+    Visual cleanup that **preserves pack_3d's stacks** (so the truck's fill %
+    is not lost) and only reorders columns within each row so:
+
+      * the tallest stacks sit at the **front** of the truck and heights
+        descend smoothly toward the back (no random "skyline" of tall
+        boxes next to single short ones);
+      * columns sit flush against each other with only a tiny visual
+        margin so the truck still looks dense.
+
+    A "column" here is a set of items that share the same X start in the
+    original packing — these were already stacked on top of each other by
+    `pack_once`, and we never break those stacks.
+
+    Falls back to the original packing if any safety check fails.
+    """
+    if not placements:
+        return placements
+
+    c = container[container_type]
+    centers = _detect_natural_rows(placements, c["width"])
+    n_rows = len(centers)
+    if n_rows == 0:
+        return placements
+
+    rows: list[list[dict]] = [[] for _ in range(n_rows)]
+    for p in placements:
+        cy_p = (p["y"] + p["y_e"]) / 2.0
+        nearest = min(range(n_rows), key=lambda i: abs(centers[i] - cy_p))
+        rows[nearest].append(p)
+
+    # Tiny visual gap so adjacent columns don't visually merge, but no
+    # forced front offset — every mm of truck length should be usable.
+    GAP_X = 10
+    FRONT_X = 0
+    new_placements: list[dict] = []
+
+    for row_idx, items in enumerate(rows):
+        if not items:
+            continue
+
+        cols: dict[int, list[dict]] = defaultdict(list)
+        for p in items:
+            cols[round(p["x"])].append(p)
+
+        ordered = sorted(
+            cols.values(),
+            key=lambda col: (
+                -max(p["z_e"] for p in col),
+                -sum(p["h"] for p in col),
+                -max(p["l"] for p in col),
+            ),
+        )
+
+        x_cursor = FRONT_X
+        cy = centers[row_idx]
+        for col in ordered:
+            col.sort(key=lambda p: p["z"])
+            col_l = max(p["l"] for p in col)
+            col_w = max(p["w"] for p in col)
+
+            y0 = cy - col_w / 2.0
+            y1 = y0 + col_w
+            if y0 < 0:
+                y0, y1 = 0.0, col_w
+            if y1 > c["width"]:
+                y1, y0 = float(c["width"]), float(c["width"]) - col_w
+
+            for p in col:
+                np_ = dict(p)
+                np_["x"] = x_cursor
+                np_["x_e"] = x_cursor + p["l"]
+                inner_off = (col_w - p["w"]) / 2.0
+                np_["y"] = y0 + inner_off
+                np_["y_e"] = np_["y"] + p["w"]
+                new_placements.append(np_)
+            x_cursor += col_l + GAP_X
+
+        if x_cursor > c["length"] + FRONT_X:
+            return placements
+
+    for i, a in enumerate(new_placements):
+        for b in new_placements[i + 1:]:
+            if overlaps(a, b):
+                return placements
+
+    if not placements_respect_stapelfaktor(new_placements, load_ref):
+        return placements
+
+    bins = compute_x_weight_bins(new_placements, x_max=c["length"])
+    bs = 1000
+    for x_bin, w_in_bin in bins.items():
+        if w_in_bin > allowed_weight_at_x(x_bin + bs / 2, chart):
+            return placements
+
+    return new_placements
+
+
+def _try_fit_into_existing(
+    host_placements, extra_items, container_type, chart, forbidden_on
+):
+    """
+    Try to add `extra_items` on top of / next to an *existing* packing without
+    moving any host item. For each extra item we sweep candidate positions:
+    on top of every host item, then to the right of every host item, then on
+    the floor at the back of the truck. The first position that passes all
+    physical constraints (overlap, weight curve, forbidden_on, stapelfaktor,
+    corner support) wins. Items that don't fit are simply skipped.
+
+    Returns the augmented placement list. Host items are returned unchanged
+    (positions / extents preserved).
+    """
+    placements = [dict(p) for p in host_placements]
+    c = container[container_type]
+
+    items_sorted = sorted(
+        extra_items,
+        key=lambda kb: kb[1]["length"] * kb[1]["width"] * kb[1]["height"],
+    )
+
+    for name, box in items_sorted:
+        sf = _stapelfaktor_from_box(box)
+        rotations = [
+            (box["length"], box["width"], box["height"]),
+            (box["width"], box["length"], box["height"]),
+        ]
+
+        # Collect candidate (x, y, z) anchors. Prefer top-of-stack first so
+        # small items naturally ride on bigger ones.
+        seen: set[tuple[int, int, int]] = set()
+        candidates: list[tuple[float, float, float]] = []
+
+        def _push(x, y, z):
+            key = (round(x), round(y), round(z))
+            if key in seen:
+                return
+            seen.add(key)
+            candidates.append((x, y, z))
+
+        for p in placements:
+            _push(p["x"], p["y"], p["z_e"])
+        for p in placements:
+            _push(p["x_e"] + 30, p["y"], 0)
+        for p in placements:
+            _push(p["x"], p["y_e"] + 30, 0)
+        max_x = max((p["x_e"] for p in placements), default=30)
+        _push(30, 30, 0)
+        _push(max_x + 30, 30, 0)
+
+        placed = False
+        for px, py, pz in candidates:
+            if placed:
+                break
+            for l, w, h in rotations:
+                if px < 0 or py < 0 or pz < 0:
+                    continue
+                if px + l > c["length"] or py + w > c["width"] or pz + h > c["height"]:
+                    continue
+                candidate = {
+                    "item": name,
+                    "x": px, "y": py, "z": pz,
+                    "x_e": px + l, "y_e": py + w, "z_e": pz + h,
+                    "l": l, "w": w, "h": h,
+                    "weight": box["weight"],
+                    "pallet_type": box["pallet_type"],
+                }
+                if any(overlaps(candidate, p) for p in placements):
+                    continue
+                if pz > 0 and not has_corner_support(candidate, placements):
+                    continue
+                if violates_forbidden(candidate, placements, forbidden_on):
+                    continue
+                if violates_stapelfaktor(candidate, placements, sf):
+                    continue
+                trial = placements + [candidate]
+                bins = compute_x_weight_bins(trial, x_max=c["length"])
+                if any(
+                    bins[xb] > allowed_weight_at_x(xb + 500, chart) for xb in bins
+                ):
+                    continue
+                placements.append(candidate)
+                placed = True
+                break
+
+    return placements
+
+
+def _consolidate_pack_once(host_kvs, tail_kvs, container_type, chart, forbidden_on, runs):
+    """
+    Repack `host + tail` items into a single container with packings biased
+    toward keeping every host item placed. Tries a handful of host-first
+    seedings (legacy / volume-desc / weight-desc), then a few random shuffles.
+    Returns the largest placement set found.
+    """
+    all_kvs = host_kvs + tail_kvs
+    tail_small_first = sorted(
+        tail_kvs, key=lambda x: x[1]["length"] * x[1]["width"] * x[1]["height"]
+    )
+    tail_large_first = sorted(
+        tail_kvs, key=lambda x: -(x[1]["length"] * x[1]["width"] * x[1]["height"])
+    )
+
+    seeds: list[list] = [
+        sorted(all_kvs, key=lambda x: x[1]["length"]),
+        sorted(all_kvs, key=lambda x: -(x[1]["length"] * x[1]["width"] * x[1]["height"])),
+        sorted(host_kvs, key=lambda x: x[1]["length"]) + tail_small_first,
+        sorted(host_kvs, key=lambda x: -(x[1]["length"] * x[1]["width"] * x[1]["height"]))
+        + tail_small_first,
+        sorted(host_kvs, key=lambda x: -x[1]["weight"]) + tail_small_first,
+        tail_small_first
+        + sorted(host_kvs, key=lambda x: -(x[1]["length"] * x[1]["width"] * x[1]["height"])),
+        sorted(host_kvs, key=lambda x: -x[1]["height"]) + tail_large_first,
+    ]
+
+    best: list[dict] = []
+    best_score = (-1, -1.0, -1.0)
+    for seed in seeds:
+        plc = pack_once(container_type, seed, chart, forbidden_on, resort=False)
+        score = (
+            len(plc),
+            sum(p["l"] * p["w"] * p["h"] for p in plc),
+            sum(p["weight"] for p in plc),
+        )
+        if score > best_score:
+            best, best_score = plc, score
+
+    extra = max(0, runs - len(seeds))
+    for _ in range(extra):
+        shuffled = all_kvs[:]
+        random.shuffle(shuffled)
+        plc = pack_once(container_type, shuffled, chart, forbidden_on, resort=False)
+        score = (
+            len(plc),
+            sum(p["l"] * p["w"] * p["h"] for p in plc),
+            sum(p["weight"] for p in plc),
+        )
+        if score > best_score:
+            best, best_score = plc, score
+
+    return best
+
+
+def pack_multi_trucks(
+    container_type: str,
+    dated_items: list[tuple[str, dict, date]],
+    backup_days: int,
+    chart,
+    forbidden_on: dict,
+    runs: int = 100,
+    progress=None,
+) -> tuple[list[dict], list[tuple[str, date]]]:
+    """
+    Greedy bucketed packing for catalog mode.
+
+    Items are sorted by Abholtermin. Each "bucket" starts at the earliest unassigned date
+    and includes all later items whose date is within `backup_days` of that anchor.
+    A bucket is poured into trucks one after another (filling each fully via `pack_3d`)
+    until empty or no further item fits. The next bucket always starts a new truck —
+    so a half-full truck whose deadline has passed will not pick up far-future items.
+
+    After each bucket is poured we run a small consolidation pass: any trailing
+    trucks whose combined items fit in one truck are merged, so we don't leave
+    a half-empty truck dangling when its contents could have ridden in the
+    previous one.
+
+    `progress` (optional) is a callable `fn(stage: str, done: int, total: int, detail: str)`
+    invoked after each truck is packed so the caller can update a UI.
+
+    Returns `(trucks, unplaceable)`.
+    """
+    sorted_items = sorted(dated_items, key=lambda t: (t[2], t[0]))
+    n = len(sorted_items)
+    cont = container[container_type]
+    cont_vol_m3 = (cont["length"] * cont["width"] * cont["height"]) / 1e9
+
+    def _make_truck(placements, placed_entries, anchor, window_end):
+        occ_vol = sum(p["l"] * p["w"] * p["h"] for p in placements) / 1e9
+        return {
+            "placements": [dict(p) for p in placements],
+            "items_dates": [(k, d) for (k, _b, d) in placed_entries],
+            "_entries": list(placed_entries),  # kept for consolidation, stripped before return
+            "anchor_date": anchor,
+            "window_end": window_end,
+            "container_type": container_type,
+            "fill_volume_m3": occ_vol,
+            "fill_pct": (occ_vol / cont_vol_m3 * 100.0) if cont_vol_m3 > 0 else 0.0,
+            "weight_kg": sum(p["weight"] for p in placements),
+        }
+
+    def _entries_to_truck(entries, placements, anchor, window_end):
+        load_ref = {k: b for (k, b, _) in entries}
+        placements = smooth_row_heights(
+            placements, container_type, chart, load_ref
+        )
+        need = Counter(p["item"] for p in placements)
+        placed_entries, kept = [], []
+        for entry in entries:
+            if need[entry[0]] > 0:
+                placed_entries.append(entry)
+                need[entry[0]] -= 1
+            else:
+                kept.append(entry)
+        return _make_truck(placements, placed_entries, anchor, window_end), kept
+
+    def _pack_entries(entries, anchor, window_end, runs_override=None):
+        placements, _un, _placed = pack_3d(
+            container_type,
+            [(k, b) for (k, b, _) in entries],
+            chart,
+            forbidden_on,
+            runs=runs_override if runs_override is not None else runs,
+        )
+        if not placements:
+            return None, list(entries)
+        return _entries_to_truck(entries, placements, anchor, window_end)
+
+    def _consolidate_into_host(host_entries, tail_entries, anchor, window_end, runs_override):
+        host_kvs = [(k, b) for (k, b, _) in host_entries]
+        tail_kvs = [(k, b) for (k, b, _) in tail_entries]
+        all_entries = list(host_entries) + list(tail_entries)
+
+        # Strategy A: keep the host's already-packed truck intact and just slot
+        # tail items on top of / next to existing items. This is the cheapest
+        # and most "respectful" merge — host items don't move at all.
+        host_truck = next(
+            (t for t in bucket_trucks if t["_entries"] == host_entries), None
+        )
+        if host_truck is not None:
+            plc_a = _try_fit_into_existing(
+                host_truck["placements"], tail_kvs,
+                container_type, chart, forbidden_on,
+            )
+            need_a = Counter(p["item"] for p in plc_a)
+            if sum(need_a.values()) > sum(
+                Counter(p["item"] for p in host_truck["placements"]).values()
+            ):
+                cand_a, kept_a = _entries_to_truck(
+                    all_entries, plc_a, anchor, window_end
+                )
+                if cand_a is not None and len(cand_a["_entries"]) > len(host_entries):
+                    return cand_a, kept_a
+
+        # Strategy B: full re-pack with host-first seedings.
+        plc = _consolidate_pack_once(
+            host_kvs, tail_kvs, container_type, chart, forbidden_on,
+            runs=runs_override,
+        )
+        if not plc:
+            return None, list(host_entries) + list(tail_entries)
+        return _entries_to_truck(all_entries, plc, anchor, window_end)
+
+    trucks: list[dict] = []
+    unplaceable: list[tuple[str, date]] = []
+
+    total_items_for_progress = n
+    items_placed_so_far = 0
+
+    i = 0
+    while i < n:
+        anchor = sorted_items[i][2]
+        window_end = anchor + timedelta(days=int(max(0, backup_days)))
+        j = i
+        bucket: list[tuple[str, dict, date]] = []
+        while j < n and sorted_items[j][2] <= window_end:
+            bucket.append(sorted_items[j])
+            j += 1
+
+        bucket_trucks: list[dict] = []
+        remaining = list(bucket)
+        while remaining:
+            truck, remaining = _pack_entries(remaining, anchor, window_end)
+            if truck is None:
+                for k, _b, d in remaining:
+                    unplaceable.append((k, d))
+                remaining = []
+                break
+            bucket_trucks.append(truck)
+            items_placed_so_far += len(truck["_entries"])
+            if progress is not None:
+                try:
+                    progress(
+                        "pack",
+                        items_placed_so_far,
+                        total_items_for_progress,
+                        f"Truck {len(trucks) + len(bucket_trucks)} · "
+                        f"{truck['fill_pct']:.0f}% fill · {len(truck['_entries'])} items",
+                    )
+                except Exception:
+                    pass
+
+        # Consolidation: while the bucket's tail truck is under-filled, try to
+        # absorb it into any earlier truck in the same bucket. The packer used
+        # here is host-first biased — it preserves the host's items and only
+        # tries to slot the tail's items into the remaining space. Accepts
+        # partial absorption (the tail shrinks) as long as it makes progress.
+        CONSOLIDATE_RUNS = max(20, runs)
+        UNDERFILL_THRESHOLD = 60.0
+        SAFETY_PASSES = 8
+        for _pass in range(SAFETY_PASSES):
+            if len(bucket_trucks) < 2:
+                break
+            tail = bucket_trucks[-1]
+            if tail["fill_pct"] >= UNDERFILL_THRESHOLD:
+                break
+
+            absorbed = False
+            for host_idx in range(len(bucket_trucks) - 1):
+                host = bucket_trucks[host_idx]
+                merged, leftover_entries = _consolidate_into_host(
+                    host["_entries"], tail["_entries"], anchor, window_end,
+                    runs_override=CONSOLIDATE_RUNS,
+                )
+                if merged is None:
+                    continue
+                merged_count = len(merged["_entries"])
+                host_count = len(host["_entries"])
+                tail_count = len(tail["_entries"])
+                # Reject if no tail items got absorbed.
+                if merged_count <= host_count:
+                    continue
+
+                if not leftover_entries:
+                    bucket_trucks[host_idx] = merged
+                    bucket_trucks.pop()
+                    absorbed = True
+                    if progress is not None:
+                        try:
+                            progress(
+                                "consolidate",
+                                items_placed_so_far,
+                                total_items_for_progress,
+                                f"Tail merged into truck {len(trucks) + host_idx + 1} "
+                                f"→ {merged['fill_pct']:.0f}% fill",
+                            )
+                        except Exception:
+                            pass
+                    break
+
+                # Partial absorb: re-pack the leftovers into a new (smaller) tail.
+                new_tail, _ = _pack_entries(
+                    leftover_entries, anchor, window_end, runs_override=CONSOLIDATE_RUNS
+                )
+                if new_tail is None:
+                    continue
+                if len(new_tail["_entries"]) >= tail_count:
+                    continue
+
+                bucket_trucks[host_idx] = merged
+                bucket_trucks[-1] = new_tail
+                absorbed = True
+                if progress is not None:
+                    try:
+                        progress(
+                            "consolidate",
+                            items_placed_so_far,
+                            total_items_for_progress,
+                            f"Pushed {merged_count - host_count} item(s) "
+                            f"from tail into truck {len(trucks) + host_idx + 1}",
+                        )
+                    except Exception:
+                        pass
+                break
+
+            if not absorbed:
+                break
+
+        trucks.extend(bucket_trucks)
+        i = j
+
+    # ===== Cross-bucket forward consolidation =====
+    # Allow an under-filled truck's items to ride a *later* truck if the
+    # delivery delay (later_truck.anchor − item.date) is within `backup_days`.
+    # We never move items the other way (an item can always be delivered
+    # earlier — that was already handled by within-bucket packing).
+    def _refresh_truck(t):
+        occ = sum(p["l"] * p["w"] * p["h"] for p in t["placements"]) / 1e9
+        t["fill_volume_m3"] = occ
+        t["fill_pct"] = (occ / cont_vol_m3 * 100.0) if cont_vol_m3 > 0 else 0.0
+        t["weight_kg"] = sum(p["weight"] for p in t["placements"])
+        t["items_dates"] = [(k, d) for (k, _b, d) in t["_entries"]]
+        if t["_entries"]:
+            t["anchor_date"] = min(d for (_k, _b, d) in t["_entries"])
+
+    UNDERFILL_FORWARD = 50.0
+    FORWARD_PASSES = 6
+    trucks.sort(key=lambda t: t["anchor_date"])
+    for _fpass in range(FORWARD_PASSES):
+        moved_anything = False
+        i = 0
+        while i < len(trucks):
+            t = trucks[i]
+            if t["fill_pct"] >= UNDERFILL_FORWARD or not t["_entries"]:
+                i += 1
+                continue
+
+            for j in range(i + 1, len(trucks)):
+                t_later = trucks[j]
+                # Bind against the *latest* date already in the host truck:
+                # adding our item shouldn't cause the host's effective
+                # delivery (its latest item) to exceed item.date + backup_days.
+                if not t_later["_entries"]:
+                    continue
+                t_later_latest = max(d for (_k, _b, d) in t_later["_entries"])
+
+                eligible_indices: list[int] = []
+                for idx, (_k, _b, d) in enumerate(t["_entries"]):
+                    delay_days = (t_later_latest - d).days
+                    if 0 <= delay_days <= backup_days:
+                        eligible_indices.append(idx)
+                if not eligible_indices:
+                    continue
+
+                eligible_kvs = [
+                    (t["_entries"][idx][0], t["_entries"][idx][1])
+                    for idx in eligible_indices
+                ]
+                old_count = len(t_later["placements"])
+                new_placements = _try_fit_into_existing(
+                    t_later["placements"], eligible_kvs,
+                    container_type, chart, forbidden_on,
+                )
+                if len(new_placements) <= old_count:
+                    continue
+
+                placed_extras = new_placements[old_count:]
+                placed_names = Counter(p["item"] for p in placed_extras)
+                moved_entries: list[tuple[str, dict, date]] = []
+                kept_entries: list[tuple[str, dict, date]] = []
+                eligible_set = set(eligible_indices)
+                for idx, entry in enumerate(t["_entries"]):
+                    if idx in eligible_set and placed_names.get(entry[0], 0) > 0:
+                        moved_entries.append(entry)
+                        placed_names[entry[0]] -= 1
+                    else:
+                        kept_entries.append(entry)
+
+                if not moved_entries:
+                    continue
+
+                # Snapshot the host's pre-merge state so we can roll back
+                # cleanly if the donor's leftover-repack fails. We must take
+                # the snapshot *before* smoothing, because smoothing reorders
+                # the placements list.
+                host_snapshot = {
+                    "placements": [dict(p) for p in t_later["placements"]],
+                    "_entries": list(t_later["_entries"]),
+                    "fill_volume_m3": t_later["fill_volume_m3"],
+                    "fill_pct": t_later["fill_pct"],
+                    "weight_kg": t_later["weight_kg"],
+                    "items_dates": list(t_later["items_dates"]),
+                    "anchor_date": t_later["anchor_date"],
+                }
+
+                merged_entries = list(t_later["_entries"]) + moved_entries
+                load_ref = {k: b for (k, b, _) in merged_entries}
+                t_later["placements"] = smooth_row_heights(
+                    new_placements, container_type, chart, load_ref
+                )
+                t_later["_entries"] = merged_entries
+                _refresh_truck(t_later)
+
+                if not kept_entries:
+                    removed_count = len(moved_entries)
+                    trucks.pop(i)
+                    if progress is not None:
+                        try:
+                            progress(
+                                "forward",
+                                items_placed_so_far,
+                                total_items_for_progress,
+                                f"Forwarded all {removed_count} item(s) of an "
+                                f"under-filled truck into a later truck "
+                                f"(within {backup_days}-day delay window)",
+                            )
+                        except Exception:
+                            pass
+                    moved_anything = True
+                    break
+
+                rep_pack, _ = _pack_entries(
+                    kept_entries, t["anchor_date"], t["window_end"],
+                    runs_override=max(20, runs // 2),
+                )
+                if rep_pack is None:
+                    t_later.update(host_snapshot)
+                    continue
+
+                trucks[i] = rep_pack
+                if progress is not None:
+                    try:
+                        progress(
+                            "forward",
+                            items_placed_so_far,
+                            total_items_for_progress,
+                            f"Forwarded {len(moved_entries)} item(s) into a "
+                            f"later truck, repacked the remainder",
+                        )
+                    except Exception:
+                        pass
+                moved_anything = True
+                break
+
+            if not moved_anything:
+                i += 1
+            else:
+                trucks.sort(key=lambda t: t["anchor_date"])
+                break
+
+        if not moved_anything:
+            break
+
+    # Renumber happens implicitly at render time (truck index = position).
+    for t in trucks:
+        t.pop("_entries", None)
+
+    return trucks, unplaceable
 
 
 def _legend_symbol(index: int) -> str:
@@ -1154,6 +2040,199 @@ def cuboid_faces_from_extents(x, y, z, x_e, y_e, z_e):
         [v[1], v[2], v[6], v[5]],  
         [v[0], v[3], v[7], v[4]],  
     ]
+
+
+def _build_truck_figure(
+    container_type: str,
+    placements: list[dict],
+    selected_keys: list[str],
+    denote: dict[str, str],
+    weight: float,
+    occ_volume_m3: float,
+    remaining_volume_m3: float,
+    assigned_items: dict[str, int],
+    header_text: str,
+    extra_legend_lines: str = "",
+):
+    """
+    Same 5-views + distribution-curve + legend layout as the single-run result page,
+    sized for one truck. Returns the matplotlib figure (caller closes it).
+    """
+    c = container[container_type]
+    x_max, y_max, z_max = c["length"], c["width"], c["height"]
+
+    NUM_ROWS = 3
+    ROW_HEIGHT = y_max / NUM_ROWS
+    bands: dict[int, list[dict]] = {0: [], 1: [], 2: []}
+    for p in placements:
+        y_center = (p["y"] + p["y_e"]) / 2
+        bi = int(y_center // ROW_HEIGHT)
+        bi = min(bi, NUM_ROWS - 1)
+        bands[bi].append(p)
+
+    band_metrics: dict[int, tuple[float, float, float]] = {}
+    for band, items_in_band in bands.items():
+        if not items_in_band:
+            band_metrics[band] = (0, 0, 0)
+        else:
+            band_metrics[band] = (
+                sum(p["weight"] for p in items_in_band),
+                max(p["x_e"] for p in items_in_band),
+                sum(p["h"] for p in items_in_band),
+            )
+    sorted_bands = sorted(band_metrics.items(), key=lambda x: (-x[1][0], -x[1][1], -x[1][2]))
+    band_remap: dict[int, int] = {}
+    for new_idx, (orig, _) in enumerate(sorted_bands):
+        band_remap[orig] = new_idx
+    for b in bands.keys():
+        if b not in band_remap:
+            band_remap[b] = len(band_remap)
+    band_new_y_start = {orig: band_remap[orig] * ROW_HEIGHT for orig in range(NUM_ROWS)}
+
+    views = {"3D Overview": "all", "Row 1": 0, "Row 2": 1, "Row 3": 2, "Top View": "all"}
+    row_colors = {0: "blue", 1: "red", 2: "green"}
+    view_angles = {
+        "3D Overview": (30, 110),
+        "Row 1": (0, 90),
+        "Row 2": (0, 90),
+        "Row 3": (0, 90),
+        "Top View": (90, 90),
+    }
+
+    fig = plt.figure(figsize=(20, 12))
+    fig.suptitle(header_text, fontsize=11, y=0.995)
+    # Same 3×4 cell layout as the original single-truck figure so plot panels
+    # keep their full size; the legend takes the otherwise-empty bottom-right
+    # block (rows 1–2, cols 2–3).
+    gs = fig.add_gridspec(3, 4, hspace=0.30, wspace=0.25)
+    plot_axes = [
+        gs[0, 0], gs[0, 1], gs[0, 2], gs[0, 3],  # 3D Overview, Row 1, Row 2, Row 3
+        gs[1, 0],  # Top View
+    ]
+    distribution_slot = gs[1, 1]
+    legend_slot = gs[1:3, 2:4]
+
+    def _draw_container_wireframe(ax, x0, y0, z0, x1, y1, z1):
+        """Outline the container in a soft grey wireframe so the user can
+        see the truck's boundary in every view (the previous chart had no
+        explicit boundary, which made loads near the back look like they
+        were spilling out)."""
+        edges = [
+            ((x0, y0, z0), (x1, y0, z0)), ((x0, y1, z0), (x1, y1, z0)),
+            ((x0, y0, z1), (x1, y0, z1)), ((x0, y1, z1), (x1, y1, z1)),
+            ((x0, y0, z0), (x0, y1, z0)), ((x1, y0, z0), (x1, y1, z0)),
+            ((x0, y0, z1), (x0, y1, z1)), ((x1, y0, z1), (x1, y1, z1)),
+            ((x0, y0, z0), (x0, y0, z1)), ((x1, y0, z0), (x1, y0, z1)),
+            ((x0, y1, z0), (x0, y1, z1)), ((x1, y1, z0), (x1, y1, z1)),
+        ]
+        for (a, b) in edges:
+            ax.plot(*zip(a, b), color="#8a8a8a", linewidth=0.8, linestyle="--", alpha=0.7)
+
+    for i, title in enumerate(views.keys(), 1):
+        ax = fig.add_subplot(plot_axes[i - 1], projection="3d")
+        _draw_container_wireframe(ax, 0, 0, 0, x_max, y_max, z_max)
+        for p in placements:
+            y_center = (p["y"] + p["y_e"]) / 2
+            orig = int(y_center // ROW_HEIGHT)
+            orig = min(orig, NUM_ROWS - 1)
+            new_row_index = band_remap[orig]
+            if isinstance(views[title], int) and new_row_index != views[title]:
+                continue
+            if title in ("3D Overview", "Top View"):
+                band_offset = band_new_y_start[orig]
+                local_y_offset = p["y"] - (orig * ROW_HEIGHT)
+                y_plot = band_offset + local_y_offset
+                y_e_plot = y_plot + (p["y_e"] - p["y"])
+            else:
+                y_plot = p["y"]
+                y_e_plot = p["y_e"]
+            # Visual inset so adjacent same-colour items get a thin gap between them
+            # (purely cosmetic — actual packing positions/extents are unchanged).
+            _ix = min(25.0, max(5.0, (p["x_e"] - p["x"]) * 0.04))
+            _iy = min(25.0, max(5.0, (y_e_plot - y_plot) * 0.04))
+            _iz = min(15.0, max(3.0, (p["z_e"] - p["z"]) * 0.04))
+            faces = cuboid_faces_from_extents(
+                p["x"] + _ix, y_plot + _iy, p["z"] + _iz,
+                p["x_e"] - _ix, y_e_plot - _iy, p["z_e"] - _iz,
+            )
+            color = row_colors.get(new_row_index, "gray")
+            ax.add_collection3d(
+                Poly3DCollection(
+                    faces, facecolor=color, edgecolor="k", linewidth=0.6, alpha=0.55, zsort="average"
+                )
+            )
+            cx = (p["x"] + p["x_e"]) / 2
+            cy = (y_plot + y_e_plot) / 2
+            cz = p["z_e"] - 350
+            ax.text(
+                cx, cy, cz,
+                denote.get(p["item"], "?"),
+                ha="center", va="center", fontsize=9, fontweight="bold", color="black",
+            )
+        ax.set_yticks([])
+        ax.yaxis.pane.set_visible(False)
+        ax.zaxis.pane.set_visible(False)
+        elev, azim = view_angles[title]
+        ax.view_init(elev=elev, azim=azim)
+        ax.set_title(title)
+        ax.set_xlim(x_max, 0)
+        ax.set_ylim(0, y_max)
+        ax.set_zlim(0, z_max)
+        ax.set_box_aspect((x_max, y_max, z_max))
+        ax.set_xlabel("X")
+        # Force a tick at the actual container length so the user can see
+        # where the truck really ends (matplotlib otherwise stops at 12500
+        # for a 13540 mm trailer, which makes legitimately-placed items
+        # look like they're spilling out of the back).
+        _step = 2500
+        _ticks = list(range(0, int(x_max) + 1, _step))
+        if _ticks[-1] != int(x_max):
+            _ticks.append(int(x_max))
+        ax.set_xticks(_ticks)
+
+    ax = fig.add_subplot(distribution_slot)
+    x_bins = compute_x_weight_bins(placements, 1000, 14000)
+    xs, loads, allowed = [], [], []
+    for x in range(0, int(np.ceil(float(x_max))), 1000):
+        xs.append(x + 500)
+        loads.append(x_bins.get(x, 0.0))
+        allowed.append(allowed_weight_at_x(x + 500, chart))
+    ax.plot(xs, allowed, label="Allowed Weight", color="red", linestyle="--")
+    ax.plot(xs, loads, label="Occupied Weight", color="green", linestyle="--")
+    ax.set_xlabel("Length (mm)")
+    ax.set_ylabel("Weight (Kg)")
+    ax.set_title("Distribution Curve")
+    ax.legend()
+    ax.grid(True)
+
+    legend_text = "\n".join(
+        f"{k} = {denote.get(k, '?')} : {assigned_items.get(k, 0)} in this truck"
+        for k in selected_keys
+    )
+    legend_block = (
+        f"Container type: {container_type}\n"
+        f"{header_text}\n"
+        + (f"{extra_legend_lines}\n" if extra_legend_lines else "")
+        + "-------------------------------------------------------------\n"
+        "Materials in this truck — symbol ↔ count\n"
+        "-------------------------------------------------------------\n"
+        f"{legend_text}\n"
+        "-------------------------------------------------------------\n"
+        "Container Statistics\n"
+        "-------------------------------------------------------------\n"
+        f"Load Weight: {weight:.2f} kg\n"
+        f"Container Occupied Volume: {occ_volume_m3:.2f} m³\n"
+        f"Container Remaining Volume: {remaining_volume_m3:.2f} m³\n"
+        "-------------------------------------------------------------\n"
+    )
+    ax_legend = fig.add_subplot(legend_slot)
+    ax_legend.axis("off")
+    ax_legend.text(
+        0.0, 1.0, legend_block,
+        fontsize=10, va="top", ha="left", family="monospace",
+        transform=ax_legend.transAxes,
+    )
+    return fig
 
 
 def render_forbidden_expander() -> None:
@@ -1282,7 +2361,71 @@ elif st.session_state.page == "history_detail":
                 + (f" · Version: **{_mvn}**" if _mvn else (f" · Note: {_legacy}" if _legacy else ""))
                 + (f" · Changer: **{_mch}**" if _mch else "")
             )
-            if plot_png:
+            _is_multi = str(meta.get("mode", "")) == "multi"
+            if _is_multi:
+                _trucks = list(meta.get("trucks") or [])
+                _bd = int(meta.get("backup_days", 0) or 0)
+                st.caption(
+                    f"Multi-truck run · **{len(_trucks)}** truck(s) · backup **{_bd}** day(s)"
+                )
+                if _trucks:
+                    st.dataframe(
+                        pd.DataFrame([
+                            {
+                                "Truck": t.get("index", i + 1),
+                                "Anchor date": t.get("anchor_date", ""),
+                                "Window end": t.get("window_end", ""),
+                                "Items": t.get("item_count", 0),
+                                "Weight (kg)": round(float(t.get("weight_kg", 0) or 0), 1),
+                                "Fill (%)": round(float(t.get("fill_pct", 0) or 0), 1),
+                            }
+                            for i, t in enumerate(_trucks)
+                        ]),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+                _unplc = list(meta.get("unplaceable") or [])
+                if _unplc:
+                    with st.expander(f"Unplaceable items ({len(_unplc)})", expanded=False):
+                        st.dataframe(
+                            pd.DataFrame(_unplc),
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+                st.markdown("##### Open a truck")
+                for i, t in enumerate(_trucks, start=1):
+                    idx = int(t.get("index", i) or i)
+                    title = (
+                        f"Truck {idx} · {t.get('anchor_date', '—')} → ≤ {t.get('window_end', '—')} · "
+                        f"{t.get('item_count', 0)} items · {float(t.get('weight_kg', 0) or 0):.0f} kg · "
+                        f"fill {float(t.get('fill_pct', 0) or 0):.1f} %"
+                    )
+                    with st.expander(title, expanded=False):
+                        png_t = storage.load_truck_plot(rid, idx) if _stor() else None
+                        if png_t:
+                            st.image(png_t, use_container_width=True)
+                            _pdf_t = _png_bytes_to_pdf(png_t)
+                            if _pdf_t:
+                                st.download_button(
+                                    f"Download truck {idx} (PDF)",
+                                    _pdf_t,
+                                    file_name=f"{meta.get('loading_name', 'run')}_truck_{idx:03d}.pdf",
+                                    mime="application/pdf",
+                                    key=f"hd_dl_pdf_{idx}",
+                                )
+                        else:
+                            st.info("No plot stored for this truck.")
+                        ai = t.get("assigned_items") or {}
+                        if ai:
+                            st.dataframe(
+                                pd.DataFrame(
+                                    sorted(ai.items(), key=lambda kv: -int(kv[1])),
+                                    columns=["Material", "Count"],
+                                ),
+                                use_container_width=True,
+                                hide_index=True,
+                            )
+            elif plot_png:
                 _hist_pdf = _png_bytes_to_pdf(plot_png)
                 if _hist_pdf:
                     st.download_button(
@@ -1911,14 +3054,15 @@ elif st.session_state.page == "tool":
 
     with c_right:
         st.markdown("**Select item key**")
+        _ITEM_SOURCE_LABELS = {
+            "manual": "Manual entry (pick material + quantity)",
+            "excel": "Excel file (e.g. ZMM_BS_AUSWERT_V2_CLS_AUTOLOAD…)",
+            "catalog": "Full catalog (time.XLSX with Abholtermin → multi-truck)",
+        }
         item_entry = st.radio(
             "Item source",
-            options=["manual", "excel"],
-            format_func=lambda x: (
-                "Manual entry (pick material + quantity)"
-                if x == "manual"
-                else "Excel file (e.g. ZMM_BS_AUSWERT_V2_CLS_AUTOLOAD…)"
-            ),
+            options=["manual", "excel", "catalog"],
+            format_func=lambda x: _ITEM_SOURCE_LABELS[x],
             horizontal=True,
             key="item_entry_mode",
             label_visibility="collapsed",
@@ -1939,7 +3083,7 @@ elif st.session_state.page == "tool":
                     step=1,
                     value=current_value,
                 )
-        else:
+        elif item_entry == "excel":
             st.caption(
                 "Typical file: **ZMM_BS_AUSWERT_V2_CLS_AUTOLOAD_02_02_2026.XLSX** — each row is one schedule/delivery line. "
                 "By default, **quantity = number of rows** per material (the **Bestellmenge** column often repeats the order total and must not be summed for this export)."
@@ -1978,67 +3122,203 @@ elif st.session_state.page == "tool":
                         st.rerun()
                     except Exception as e:
                         st.error(str(e))
+        else:
+            st.caption(
+                "Catalog file: each row = one item with an **Abholtermin** (pickup date). "
+                "Items are grouped by date and packed into one truck after another; a half-full "
+                "truck is closed when the next item's date is outside the **backup-days** window."
+            )
+            st.number_input(
+                "Backup days (window around the earliest date in each truck)",
+                min_value=0,
+                max_value=60,
+                step=1,
+                value=int(st.session_state.get("catalog_backup_days", 4) or 4),
+                key="catalog_backup_days",
+                help="Items are eligible for the same truck only if their date is within this many days of the truck's anchor date.",
+            )
+            f_catalog = st.file_uploader(
+                "Catalog Excel (.xlsx) — e.g. time.XLSX",
+                type=["xlsx"],
+                key="catalog_xlsx_upload",
+            )
+            if st.button("Load catalog", key="btn_load_catalog"):
+                if f_catalog is None:
+                    st.error("Please choose a catalog Excel file first.")
+                else:
+                    try:
+                        entries, no_date = parse_catalog_excel(io.BytesIO(f_catalog.getvalue()))
+                        applied = [(k, d) for k, d in entries if k in ld_set]
+                        unknown_keys = sorted({k for k, _ in entries if k not in ld_set})
+                        unknown_rows = sum(1 for k, _ in entries if k not in ld_set)
+                        st.session_state["catalog_items"] = applied
+                        st.session_state["persist_catalog_xlsx"] = f_catalog.getvalue()
+                        st.session_state["catalog_total_rows"] = len(entries) + len(no_date)
+                        st.session_state["catalog_kept_rows"] = len(applied)
+                        st.session_state["catalog_unknown_keys"] = unknown_keys
+                        st.session_state["catalog_unknown_rows"] = unknown_rows
+                        st.session_state["catalog_no_date_rows"] = len(no_date)
+                        st.session_state.pop("_multi_result_cache", None)
+                        st.session_state.pop("_multi_result_saved_once", None)
+                        st.session_state.pop("_multi_loading_phase", None)
+                        st.rerun()
+                    except Exception as e:
+                        st.error(str(e))
+            cat = st.session_state.get("catalog_items") or []
+            if cat:
+                per_date = Counter(d for _, d in cat)
+                _tot = int(st.session_state.get("catalog_total_rows", len(cat)) or len(cat))
+                _kept = int(st.session_state.get("catalog_kept_rows", len(cat)) or len(cat))
+                _unk_rows = int(st.session_state.get("catalog_unknown_rows", 0) or 0)
+                _unk_keys = st.session_state.get("catalog_unknown_keys") or []
+                _nodate = int(st.session_state.get("catalog_no_date_rows", 0) or 0)
+                st.success(
+                    f"Catalog: **{_kept} of {_tot}** rows kept · "
+                    f"earliest **{min(per_date)}** · latest **{max(per_date)}** · "
+                    f"**{len(per_date)}** distinct date(s)."
+                )
+                if _unk_rows or _nodate:
+                    _msg = []
+                    if _unk_rows:
+                        _msg.append(
+                            f"**{_unk_rows}** row(s) skipped — material not in the loaded "
+                            f"material list (**{len(_unk_keys)}** distinct material number(s))"
+                        )
+                    if _nodate:
+                        _msg.append(f"**{_nodate}** row(s) skipped — missing **Abholtermin**")
+                    st.info(
+                        " · ".join(_msg)
+                        + f".  You can still click **Next** to optimize the **{_kept}** kept "
+                        "row(s) into trucks, or go back to **← Materials setup** and import a "
+                        "covering material Excel (e.g. **Materialübersicht.xlsx**) to include "
+                        "the missing materials first."
+                    )
+                    if _unk_keys:
+                        st.selectbox(
+                            f"Materials in catalog but not in selected materials ({len(_unk_keys)})",
+                            _unk_keys,
+                            index=None,
+                            placeholder=f"{len(_unk_keys)} missing material number(s) — open to browse",
+                            key="catalog_unknown_browse",
+                            help="These material numbers appear in the catalog but have no dimensions in the loaded material list, so they cannot be packed.",
+                        )
 
+    _cur_mode = st.session_state.get("item_entry_mode", "manual")
     c1, c2 = st.columns(2)
     with c1:
-        if st.session_state.get("item_entry_mode", "manual") == "manual":
+        if _cur_mode == "manual":
             if selected is not None and qty > 0:
                 st.session_state["quantities"][selected] = qty
             elif selected in st.session_state["quantities"]:
                 del st.session_state["quantities"][selected]
         st.markdown("###### Saved Quantities")
         st.write(f'Container : {st.session_state["container_selected"]} ')
-        for k, v in st.session_state["quantities"].items():
-            st.write(f"- {k} : {v}")
+        if _cur_mode == "catalog":
+            cat = st.session_state.get("catalog_items") or []
+            if cat:
+                per_key = Counter(k for k, _ in cat)
+                _tot = int(st.session_state.get("catalog_total_rows", len(cat)) or len(cat))
+                _unk_rows = int(st.session_state.get("catalog_unknown_rows", 0) or 0)
+                st.write(
+                    f"Catalog: **{len(cat)} of {_tot}** rows · "
+                    f"**{len(per_key)}** material(s) · "
+                    f"backup **{int(st.session_state.get('catalog_backup_days', 4) or 4)}** day(s)"
+                )
+                if _unk_rows:
+                    st.caption(
+                        f"⚠ {_unk_rows} row(s) dropped because their material is not in the "
+                        f"loaded material list — load **Materialübersicht.xlsx** on Materials setup "
+                        f"to include them."
+                    )
+                for k, v in per_key.most_common():
+                    st.write(f"- {k} : {v}")
+            else:
+                st.caption("No catalog loaded yet — pick **time.XLSX** above and **Load catalog**.")
+        else:
+            for k, v in st.session_state["quantities"].items():
+                st.write(f"- {k} : {v}")
+    _ld_chk = st.session_state.load_data
+    _container_picked = st.session_state.get("container_selected")
+    _need_meta = _materials_source_is_excel() and (
+        not _meta_version_name() or not _meta_changer()
+    )
+    if _cur_mode == "catalog":
+        _cat_kept = [(k, d) for k, d in (st.session_state.get("catalog_items") or []) if k in _ld_chk]
+        _bad_keys = []
+    else:
+        _cat_kept = []
+        _bad_keys = [k for k in st.session_state["quantities"] if k not in _ld_chk]
+
+    _next_blocker: str | None = None
+    if _cur_mode == "catalog":
+        if not _cat_kept and _container_picked is None:
+            _next_blocker = "both_catalog"
+        elif not _cat_kept:
+            _next_blocker = "catalog_empty"
+        elif _container_picked is None:
+            _next_blocker = "container"
+        elif _need_meta:
+            _next_blocker = "version_meta"
+    else:
+        if not st.session_state["quantities"] and _container_picked is None:
+            _next_blocker = "both"
+        elif not st.session_state["quantities"]:
+            _next_blocker = "items"
+        elif _container_picked is None:
+            _next_blocker = "container"
+        elif _bad_keys:
+            _next_blocker = "unknown_mat"
+        elif _need_meta:
+            _next_blocker = "version_meta"
+
+    warning_msg = {
+        "items": "Please add items to the container to optimize…",
+        "container": "Please select a **Container** at the top of this page to continue.",
+        "both": "Please select a container and add items to optimize…",
+        "unknown_mat": "Saved quantities include material numbers that are not in the load list. "
+        "Use Material Excel import or remove those keys.",
+        "version_meta": "**Version** and **changer** are required for **Excel** materials — "
+        "set them on **← Materials setup**, then return here.",
+        "catalog_empty": "Load a catalog file first (or none of its materials match the loaded material list).",
+        "both_catalog": "Please select a container and **Load catalog** to optimize…",
+    }
+
     with c2:
         c1_main,c2_main,_,_=st.columns([2,3,1,3])
         with c1_main:
-            if st.button("Next", key="nav_next"):
-                ld_chk = st.session_state.load_data
-                bad_keys = [k for k in st.session_state["quantities"] if k not in ld_chk]
-                if not st.session_state["quantities"] and st.session_state["container_selected"] is None:
-                    warning = True
-                    msg = "both"
-                elif not st.session_state["quantities"]:
-                    warning = True
-                    msg = "items"
-                elif st.session_state["container_selected"] is None:
-                    warning = True
-                    msg = "container"
-                elif bad_keys:
-                    warning = True
-                    msg = "unknown_mat"
-                elif _materials_source_is_excel() and (
-                    not _meta_version_name() or not _meta_changer()
-                ):
-                    warning = True
-                    msg = "version_meta"
+            _next_clicked = st.button(
+                "Next",
+                key="nav_next",
+                disabled=_next_blocker is not None,
+                help=(warning_msg.get(_next_blocker) if _next_blocker else None),
+            )
+            if _next_clicked and _next_blocker is None:
+                st.session_state.meta_container_selected = _container_picked
+                if _cur_mode == "catalog":
+                    st.session_state.pop("_multi_result_cache", None)
+                    st.session_state.pop("_multi_result_saved_once", None)
+                    st.session_state.pop("_multi_loading_phase", None)
+                    st.session_state.page = "result_multi"
                 else:
-                    st.session_state.meta_container_selected = st.session_state["container_selected"]
                     st.session_state.pop("_result_saved_once", None)
                     st.session_state.pop("_pack_result_cache", None)
                     st.session_state.page = "result"
-                    st.rerun()
+                st.toast("Running optimization — this can take a minute for large catalogs.", icon="⏳")
+                st.rerun()
         with c2_main:
             if st.button("Clear", key="c_clear"):
                 st.session_state["quantities"].clear()
                 st.session_state.pop("container_selected", None)
                 st.session_state.pop("meta_container_selected", None)
                 st.session_state.pop("_pack_result_cache", None)
+                st.session_state.pop("catalog_items", None)
+                st.session_state.pop("_multi_result_cache", None)
+                st.session_state.pop("_multi_result_saved_once", None)
+                st.session_state.pop("_multi_loading_phase", None)
                 st.rerun()
-                warning = False 
-                st.rerun()
+        if _next_blocker is not None:
+            st.warning(warning_msg[_next_blocker])
 
-    warning_msg = {
-        "items": "Please add items to the container to optimize...",
-        "container": "Please select container to optimize...",
-        "both": "Please select container and add items to optimize...",
-        "unknown_mat": "Saved quantities include material numbers that are not in the load list. "
-        "Use Material Excel import or remove those keys.",
-        "version_meta": "**Version** and **changer** are required for **Excel** materials — set them on **Materials setup** (←), then **Continue**.",
-    }
-    if warning:
-        st.warning(warning_msg.get(msg))
 
 # Page: optimization result
 elif st.session_state.page == "result":
@@ -2407,3 +3687,348 @@ elif st.session_state.page == "result":
                 mime="application/pdf",
                 key="res_dl_pdf_fallback_btn",
             )
+
+elif st.session_state.page == "result_multi":
+    if _materials_source_is_excel() and (not _meta_version_name() or not _meta_changer()):
+        st.subheader("Result — Full catalog (multi-truck)")
+        st.error(
+            "**Version** and **changer** are required for Excel-based materials — open "
+            "**← Materials setup** and set both, then **Continue**."
+        )
+        st.stop()
+
+    _ln = (st.session_state.get("loading_run_name") or "").strip()
+    _on = (st.session_state.get("operator_name") or "").strip()
+    _cn = _meta_client_name()
+    _vn = _meta_version_name()
+    _vch = _meta_changer()
+    _backup = int(st.session_state.get("catalog_backup_days", 4) or 4)
+
+    _ct = _meta_container_key()
+    if not _ct or _ct not in container:
+        st.subheader("Result — Full catalog (multi-truck)")
+        st.error("No **container** stored for this result — go back to the tool, pick a container, then **Next**.")
+        st.stop()
+
+    ld = st.session_state.load_data
+    fo = st.session_state.forbidden_on_data
+    cat = [(k, d) for k, d in (st.session_state.get("catalog_items") or []) if k in ld]
+    if not cat:
+        st.subheader("Result — Full catalog (multi-truck)")
+        st.error("No catalog items match the loaded materials. Reload **time.XLSX** and verify Materialnummer keys.")
+        st.stop()
+
+    cat_fp = hashlib.sha256(
+        (
+            json.dumps(sorted([(k, d.isoformat()) for k, d in cat]))
+            + f"|{_ct}|{_backup}|"
+            + json.dumps({k: ld[k] for k in sorted({k for k, _ in cat})}, sort_keys=True, default=str)
+            + json.dumps({k: sorted(v) for k, v in fo.items()}, sort_keys=True)
+        ).encode("utf-8")
+    ).hexdigest()
+
+    cache = st.session_state.get("_multi_result_cache")
+    if not (isinstance(cache, dict) and cache.get("fp") == cat_fp):
+        # ----- Plain full-page loading sheet (nothing else is rendered) -----
+        # All loading content lives inside ONE st.empty() container at delta
+        # position 0.  We then flush positions 1..N with empty placeholders so
+        # every old widget that the previous page (tool / result) rendered is
+        # explicitly replaced *before* the multi-second `pack_multi_trucks`
+        # call starts.  Without this, Streamlit only clears unmatched DOM
+        # positions when the script ends — meaning all the trailing tool-page
+        # widgets stay visible behind the loading sheet for the entire pack.
+        loading_root = st.empty()
+        with loading_root.container():
+            st.markdown(
+                """
+                <style>
+                  [data-testid="stSidebar"], [data-testid="stLogo"] {display: none !important;}
+                  #schnellecke-header {display: none !important;}
+                  header[data-testid="stHeader"] {background: #ffffff !important; z-index: 100000 !important;}
+                  [data-testid="stToastContainer"] {display: none !important;}
+                  html, body, .stApp,
+                  [data-testid="stAppViewContainer"],
+                  section[data-testid="stMain"],
+                  section[data-testid="stMain"] > div,
+                  section[data-testid="stMain"] > div > div {
+                    background: #ffffff !important;
+                    background-color: #ffffff !important;
+                  }
+                  .stApp {min-height: 100vh !important;}
+                  .block-container {
+                    background: #ffffff !important;
+                    min-height: calc(100vh - 60px) !important;
+                    padding-top: 8vh !important;
+                    padding-bottom: 6vh !important;
+                    max-width: 720px !important;
+                    margin: 0 auto !important;
+                    position: relative;
+                    z-index: 99999;
+                  }
+                </style>
+                """,
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                "<div style='text-align:center;padding-top:4vh;'>"
+                "<h1 style='margin-bottom:0.25rem;'>Optimizing your load</h1>"
+                f"<p style='color:#6b7280;margin-top:0;'>Packing {len(cat)} catalog items into trucks. "
+                "This can take a minute for large catalogs — please don't close the tab.</p>"
+                "</div>",
+                unsafe_allow_html=True,
+            )
+            pack_progress = st.progress(0, text="Starting bin packing…")
+            stage_caption = st.empty()
+            stage_caption.caption("Preparing items by Abholtermin window…")
+
+        # Flush every remaining DOM position from the previous page (tool page
+        # has ~30 widgets).  Each `st.empty()` claims a delta slot; with
+        # nothing put inside, it renders as an invisible placeholder, which
+        # forces Streamlit to remove whatever the *previous* run had at that
+        # slot — even though our heavy compute below keeps the script running
+        # for many seconds.
+        flush_slots = [st.empty() for _ in range(64)]
+
+        # Two-phase render: first hit just paints the overlay + flushes, then
+        # reruns so Streamlit fully commits the new (mostly-empty) DOM before
+        # we sit on the CPU for `pack_multi_trucks`.
+        if st.session_state.get("_multi_loading_phase") != "compute":
+            st.session_state["_multi_loading_phase"] = "compute"
+            st.rerun()
+
+        def _on_pack_progress(stage, done, total, detail):
+            pct = 0 if total <= 0 else min(100, int(round(done * 100 / total)))
+            # Reserve 80 % of the bar for packing; figure rendering uses the rest.
+            pack_progress.progress(
+                min(80, int(pct * 0.8)),
+                text=f"Packing {done} / {total} items",
+            )
+            stage_caption.caption(
+                f"{'Consolidating' if stage == 'consolidate' else 'Packing'} · {detail}"
+            )
+
+        dated_items = [(k, ld[k], d) for k, d in cat]
+        trucks, unplaceable = pack_multi_trucks(
+            _ct, dated_items, _backup, chart, fo, progress=_on_pack_progress
+        )
+
+        all_keys = sorted({k for k, _ in cat})
+        denote = {k: _legend_symbol(i) for i, k in enumerate(all_keys)}
+
+        cont_def = container[_ct]
+        cont_vol_m3 = (cont_def["length"] * cont_def["width"] * cont_def["height"]) / 1e9
+
+        truck_figures: list[bytes] = []
+        truck_pdfs: list[bytes] = []
+        trucks_meta_serializable: list[dict] = []
+        total_trucks = max(1, len(trucks))
+        stage_caption.caption(f"Rendering {total_trucks} truck plot(s)…")
+        for idx, t in enumerate(trucks, start=1):
+            pack_progress.progress(
+                80 + int(20 * (idx - 1) / total_trucks),
+                text=f"Rendering truck {idx} of {total_trucks}…",
+            )
+            assigned = Counter(p["item"] for p in t["placements"])
+            keys_here = [k for k in all_keys if assigned.get(k, 0) > 0]
+            occ = float(t["fill_volume_m3"])
+            rem = max(0.0, cont_vol_m3 - occ)
+            header_text = (
+                f"Truck {idx} — Anchor {t['anchor_date']} · Window ≤ {t['window_end']} · "
+                f"{sum(assigned.values())} items · Fill {t['fill_pct']:.1f}% · "
+                f"Loading: {_ln or '—'} · Client: {_cn or '—'}"
+            )
+            extra = (
+                f"Earliest date: {min(d for _, d in t['items_dates']) if t['items_dates'] else '—'}  ·  "
+                f"Latest date: {max(d for _, d in t['items_dates']) if t['items_dates'] else '—'}"
+            )
+            fig = _build_truck_figure(
+                container_type=_ct,
+                placements=t["placements"],
+                selected_keys=keys_here,
+                denote=denote,
+                weight=float(t["weight_kg"]),
+                occ_volume_m3=occ,
+                remaining_volume_m3=rem,
+                assigned_items=dict(assigned),
+                header_text=header_text,
+                extra_legend_lines=extra,
+            )
+            png_buf = io.BytesIO()
+            fig.savefig(png_buf, format="png", dpi=120, bbox_inches="tight")
+            truck_figures.append(png_buf.getvalue())
+            try:
+                pdf_buf = io.BytesIO()
+                fig.savefig(pdf_buf, format="pdf", bbox_inches="tight")
+                truck_pdfs.append(pdf_buf.getvalue())
+            except Exception:
+                truck_pdfs.append(b"")
+            plt.close(fig)
+
+            trucks_meta_serializable.append({
+                "index": idx,
+                "anchor_date": t["anchor_date"].isoformat(),
+                "window_end": t["window_end"].isoformat(),
+                "container_type": t["container_type"],
+                "weight_kg": float(t["weight_kg"]),
+                "fill_volume_m3": occ,
+                "fill_pct": float(t["fill_pct"]),
+                "item_count": int(sum(assigned.values())),
+                "assigned_items": {str(k): int(v) for k, v in assigned.items()},
+                "items_dates": [(str(k), d.isoformat()) for k, d in t["items_dates"]],
+            })
+
+        cache = {
+            "fp": cat_fp,
+            "container_type": _ct,
+            "backup_days": _backup,
+            "trucks": trucks,
+            "trucks_meta": trucks_meta_serializable,
+            "denote": denote,
+            "all_keys": all_keys,
+            "unplaceable": [(str(k), d.isoformat()) for k, d in unplaceable],
+            "truck_pngs": truck_figures,
+            "truck_pdfs": truck_pdfs,
+            "total_items": len(cat),
+        }
+        st.session_state["_multi_result_cache"] = cache
+        st.session_state.pop("_multi_loading_phase", None)
+
+        pack_progress.progress(
+            100,
+            text=f"Done — {len(trucks)} truck(s), "
+            f"{sum(t['item_count'] for t in trucks_meta_serializable)} items placed.",
+        )
+        stage_caption.caption("Loading the result page…")
+        st.rerun()
+
+    # ===== Result UI (renders only after the loading sheet has cached results) =====
+    st.subheader("Result — Full catalog (multi-truck)")
+    st.caption(
+        f"**Loading:** {_ln or '—'} · **Operator:** {_on or '—'} · "
+        f"**Client:** {_cn or '—'} · **Version:** {_vn or '—'} · "
+        f"**Changer:** {_vch or '—'} · **Backup days:** {_backup}"
+    )
+
+    nb1, nb2, nb3 = st.columns(3)
+    with nb1:
+        if st.button("← Back to tool", key="resm_tool"):
+            st.session_state.pop("_multi_result_cache", None)
+            st.session_state.pop("_multi_loading_phase", None)
+            st.session_state.page = "tool"
+            st.rerun()
+    with nb2:
+        if st.button("← Home", key="resm_home"):
+            st.session_state.pop("_multi_result_cache", None)
+            st.session_state.pop("_multi_loading_phase", None)
+            st.session_state.page = "home"
+            st.rerun()
+    with nb3:
+        if st.button("Re-run optimization", key="resm_rerun"):
+            st.session_state.pop("_multi_result_cache", None)
+            st.session_state.pop("_multi_loading_phase", None)
+            st.session_state.pop("_multi_result_saved_once", None)
+            st.rerun()
+
+    trucks_meta_serializable = cache["trucks_meta"]
+    truck_figures = cache["truck_pngs"]
+    truck_pdfs = cache["truck_pdfs"]
+    unplaceable_iso = cache["unplaceable"]
+
+    total_items = cache["total_items"]
+    placed_total = sum(t["item_count"] for t in trucks_meta_serializable)
+    unplaced_total = len(unplaceable_iso)
+    avg_fill = (
+        sum(t["fill_pct"] for t in trucks_meta_serializable) / max(1, len(trucks_meta_serializable))
+    )
+
+    s1, s2, s3, s4 = st.columns(4)
+    s1.metric("Trucks", len(trucks_meta_serializable))
+    s2.metric("Items placed", f"{placed_total} / {total_items}")
+    s3.metric("Unplaceable", unplaced_total)
+    s4.metric("Avg fill", f"{avg_fill:.1f} %")
+
+    if trucks_meta_serializable:
+        rows = [
+            {
+                "Truck": t["index"],
+                "Anchor date": t["anchor_date"],
+                "Window end": t["window_end"],
+                "Items": t["item_count"],
+                "Weight (kg)": round(t["weight_kg"], 1),
+                "Fill (%)": round(t["fill_pct"], 1),
+                "Container": t["container_type"],
+            }
+            for t in trucks_meta_serializable
+        ]
+        st.markdown("##### Trucks")
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    if unplaceable_iso:
+        with st.expander(f"Unplaceable items ({len(unplaceable_iso)})", expanded=False):
+            udf = pd.DataFrame(unplaceable_iso, columns=["Material", "Abholtermin"])
+            st.dataframe(udf, use_container_width=True, hide_index=True)
+
+    if not st.session_state.get("_multi_result_saved_once"):
+        if _stor():
+            try:
+                quantities_total = {
+                    str(k): int(v) for k, v in Counter(k for k, _ in cat).items()
+                }
+                rid = storage.save_run_multi(
+                    client=_meta_client_name() or "unknown",
+                    loading_name=_ln,
+                    operator_name=_on,
+                    version_name=_meta_version_name(),
+                    changer=_meta_changer(),
+                    container_type=str(_ct),
+                    backup_days=_backup,
+                    quantities=quantities_total,
+                    load_data=st.session_state.load_data,
+                    forbidden_on=st.session_state.forbidden_on_data,
+                    trucks_meta=trucks_meta_serializable,
+                    truck_plots_png=truck_figures,
+                    unplaceable=[
+                        {"material": k, "abholtermin": d}
+                        for k, d in unplaceable_iso
+                    ],
+                    material_xlsx=st.session_state.get("persist_material_xlsx"),
+                    stacking_xlsx=st.session_state.get("persist_stacking_xlsx"),
+                    catalog_xlsx=st.session_state.get("persist_catalog_xlsx"),
+                    summary_plot_png=truck_figures[0] if truck_figures else None,
+                )
+                if rid:
+                    st.success(f"Saved to MinIO as one history entry ({len(truck_figures)} truck plots).")
+            except Exception as e:
+                st.warning(f"Could not save to MinIO: {e}")
+        elif storage is not None and storage.storage_enabled() and not storage.minio_available():
+            st.info(
+                "MinIO save skipped: install **minio** (`pip install minio`). "
+                "Per-truck PDFs are still available below."
+            )
+        st.session_state._multi_result_saved_once = True
+
+    _slug = _safe_filename_part(_cn or "")
+    _ts = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    st.markdown("##### Open a truck")
+    for tmeta, png, pdf in zip(trucks_meta_serializable, truck_figures, truck_pdfs):
+        title = (
+            f"Truck {tmeta['index']} · {tmeta['anchor_date']} → ≤ {tmeta['window_end']} · "
+            f"{tmeta['item_count']} items · {tmeta['weight_kg']:.0f} kg · "
+            f"fill {tmeta['fill_pct']:.1f} %"
+        )
+        with st.expander(title, expanded=False):
+            st.image(png, use_container_width=True)
+            if tmeta["assigned_items"]:
+                _items_df = pd.DataFrame(
+                    sorted(tmeta["assigned_items"].items(), key=lambda kv: -kv[1]),
+                    columns=["Material", "Count"],
+                )
+                st.dataframe(_items_df, use_container_width=True, hide_index=True)
+            if pdf:
+                st.download_button(
+                    f"Download truck {tmeta['index']} (PDF)",
+                    pdf,
+                    file_name=f"{_ts}_{_slug}_truck_{tmeta['index']:03d}.pdf",
+                    mime="application/pdf",
+                    key=f"resm_dl_pdf_{tmeta['index']}",
+                )

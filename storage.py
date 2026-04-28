@@ -224,6 +224,121 @@ def load_run(run_id: str) -> tuple[dict[str, Any], bytes | None, bytes | None, b
     return meta, mat, stx, plot
 
 
+def save_run_multi(
+    *,
+    client: str,
+    loading_name: str,
+    operator_name: str,
+    version_name: str,
+    changer: str,
+    container_type: str,
+    backup_days: int,
+    quantities: dict[str, int],
+    load_data: dict,
+    forbidden_on: dict[str, set],
+    trucks_meta: list[dict[str, Any]],
+    truck_plots_png: list[bytes],
+    unplaceable: list[dict[str, Any]] | None = None,
+    material_xlsx: bytes | None = None,
+    stacking_xlsx: bytes | None = None,
+    catalog_xlsx: bytes | None = None,
+    summary_plot_png: bytes | None = None,
+) -> str | None:
+    """
+    Save a multi-truck (full-catalog) run. Each truck plot is stored as
+    `runs/{rid}/truck_{i:03d}.png`; meta carries `mode="multi"`, `trucks` list,
+    `backup_days`. The run still appears in `list_runs` like a single run.
+    """
+    if not storage_ready():
+        return None
+    ensure_bucket()
+    run_id = str(uuid.uuid4())
+    iso = datetime.now(timezone.utc).isoformat()
+    c = _client()
+
+    vn = (version_name or "").strip()
+    ch = (changer or "").strip()
+    meta = {
+        "run_id": run_id,
+        "mode": "multi",
+        "client": (client or "").strip() or "unknown",
+        "loading_name": loading_name or "",
+        "operator_name": operator_name or "",
+        "version_name": vn,
+        "changer": ch,
+        "version_note": f"{vn} — {ch}".strip(" —") if (vn or ch) else "",
+        "container_type": container_type or "",
+        "created_iso": iso,
+        "backup_days": int(backup_days),
+        "quantities": {str(k): int(v) for k, v in quantities.items()},
+        "load_data": {str(k): dict(v) for k, v in load_data.items()},
+        "forbidden_on": {str(k): sorted(v) for k, v in forbidden_on.items()},
+        "trucks": trucks_meta,
+        "unplaceable": unplaceable or [],
+        "truck_count": len(trucks_meta),
+    }
+    register_client(meta["client"])
+
+    jraw = json.dumps(meta, indent=2, default=str).encode("utf-8")
+    c.put_object(_BUCKET, _meta_key(run_id), io.BytesIO(jraw), length=len(jraw), content_type="application/json")
+
+    for i, png in enumerate(truck_plots_png, start=1):
+        if not png:
+            continue
+        c.put_object(
+            _BUCKET,
+            f"runs/{run_id}/truck_{i:03d}.png",
+            io.BytesIO(png),
+            length=len(png),
+            content_type="image/png",
+        )
+    if summary_plot_png:
+        c.put_object(
+            _BUCKET,
+            f"runs/{run_id}/plot.png",
+            io.BytesIO(summary_plot_png),
+            length=len(summary_plot_png),
+            content_type="image/png",
+        )
+    if material_xlsx:
+        c.put_object(
+            _BUCKET,
+            f"runs/{run_id}/material.xlsx",
+            io.BytesIO(material_xlsx),
+            length=len(material_xlsx),
+            content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    if stacking_xlsx:
+        c.put_object(
+            _BUCKET,
+            f"runs/{run_id}/stacking.xlsx",
+            io.BytesIO(stacking_xlsx),
+            length=len(stacking_xlsx),
+            content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    if catalog_xlsx:
+        c.put_object(
+            _BUCKET,
+            f"runs/{run_id}/catalog.xlsx",
+            io.BytesIO(catalog_xlsx),
+            length=len(catalog_xlsx),
+            content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    return run_id
+
+
+def load_truck_plot(run_id: str, truck_index_1based: int) -> bytes | None:
+    """Fetch one truck PNG from a multi-truck run."""
+    if not storage_ready():
+        return None
+    try:
+        c = _client()
+        o = c.get_object(_BUCKET, f"runs/{run_id}/truck_{int(truck_index_1based):03d}.png")
+        return o.read()
+    except Exception:
+        return None
+
+
 def delete_run(run_id: str) -> None:
     c = _client()
     prefix = f"runs/{run_id}/"
